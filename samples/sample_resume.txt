@@ -1,0 +1,17 @@
+John Doe
+Email: john.doe@email.com | Phone: (123) 456-7890 | Dallas, TX
+
+SUMMARY
+Data science graduate with experience building ML models and dashboards.
+
+SKILLS
+Python, Pandas, scikit-learn, SQL, Streamlit, Git, Azure, NumPy, Matplotlib
+
+EXPERIENCE
+Data Science Intern, ACME Corp — 2024
+- Built a regression model to forecast weekly sales; improved MAPE by 12%.
+- Automated data cleaning pipeline; reduced processing time by 30%.
+- Created KPIs dashboard for stakeholders with Streamlit.
+
+EDUCATION
+M.S. in Data Science, UTA (2025)

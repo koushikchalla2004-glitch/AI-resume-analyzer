@@ -1,0 +1,15 @@
+Machine Learning Engineer (Entry Level)
+
+Responsibilities:
+- Build and deploy end-to-end ML models in Python
+- Preprocess data, engineer features, and evaluate model performance
+- Collaborate with engineering and product teams
+- Create dashboards and communicate insights to stakeholders
+
+Requirements:
+- Proficiency with Python, scikit-learn, Pandas, SQL
+- Experience with model evaluation and tuning
+- Familiarity with cloud platforms (Azure/AWS/GCP)
+- Strong communication skills and teamwork
+
+
