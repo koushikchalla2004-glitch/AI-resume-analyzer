@@ -183,7 +183,7 @@ def example_bullets():
 
 # ========= UI =========
 st.set_page_config(page_title="AI Resume & Job Matcher", page_icon="💼")
-st.title("💼 AI Resume & Job Matcher — Starter (with diagnostics)")
+st.title("💼 AI Resume & Job Matcher — Starter")
 st.write("Upload your resume, paste a JD, get a **match score**, **keyword coverage**, **ATS checks**, and **tips**. Optional: **AI rewrite** with OpenAI.")
 
 with st.sidebar:
@@ -257,7 +257,7 @@ if st.button("🔎 Score My Resume", type="primary"):
 
 # ========= AI Rewrite Section (uses session-state texts) =========
 st.markdown("---")
-st.markdown("### ✨ AI Rewrite (optional)")
+st.markdown("### ✨ AI Rewrite")
 
 if not st.session_state.rt or not st.session_state.jd:
     st.info("Add a resume and JD above, then click **Score My Resume** first. The rewrite uses those texts.")
