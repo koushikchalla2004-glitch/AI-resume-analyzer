@@ -1,298 +1,168 @@
 import os
-import re
 import io
+import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
-# ML similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+# ---- MUST be the first Streamlit call ----
+st.set_page_config(page_title="US University Recommender", page_icon="🎓", layout="wide")
 
-# Optional parsers
-try:
-    import docx2txt
-except Exception:
-    docx2txt = None
-
-try:
-    import PyPDF2
-except Exception:
-    PyPDF2 = None
-
-
-# ========= OpenAI: robust import + lazy client =========
-def _sdk_info():
-    try:
-        import openai  # just to read version
-        ver = getattr(openai, "__version__", "unknown")
-        return True, ver
-    except Exception:
-        return False, None
-
-
-_OPENAI_INSTALLED, _OPENAI_VERSION = _sdk_info()
-
-
-def get_openai_client():
-    """
-    Build a client *when needed*.
-    Returns (client, err_msg). If err_msg is not None, show it to the user.
-    """
-    if not _OPENAI_INSTALLED:
-        return None, "OpenAI SDK not installed. Run: pip install openai"
-
-    try:
-        from openai import OpenAI
-    except Exception as e:
-        return None, f"OpenAI import failed: {e}"
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None, "OPENAI_API_KEY not set in this session. In PowerShell: $env:OPENAI_API_KEY=\"sk-...\""
-
-    try:
-        client = OpenAI()  # reads env var
-        return client, None
-    except Exception as e:
-        return None, f"Failed to initialize OpenAI client: {e}"
-
-
-# ========= Helpers =========
-def extract_text_from_upload(uploaded_file):
-    """Extract plain text from uploaded .txt/.docx/.pdf; fallback to best-effort decode."""
-    if uploaded_file is None:
-        return ""
-    name = uploaded_file.name.lower()
-    content = uploaded_file.read()
-    try:
-        uploaded_file.seek(0)
-    except Exception:
-        pass
-
-    # .txt
-    if name.endswith(".txt"):
-        for enc in ("utf-8", "latin-1"):
-            try:
-                return content.decode(enc, errors="ignore")
-            except Exception:
-                continue
-        return ""
-
-    # .docx
-    if name.endswith(".docx") and docx2txt is not None:
+# ---- Env/Secrets handling (NO warning locally) ----
+def configure_api_key():
+    load_dotenv()  # read .env for local runs
+    if os.getenv("SCORECARD_API_KEY"):
+        return
+    # Only try st.secrets if a secrets.toml actually exists
+    user_secrets = os.path.expanduser("~/.streamlit/secrets.toml")
+    proj_secrets = os.path.join(os.getcwd(), ".streamlit", "secrets.toml")
+    if os.path.exists(user_secrets) or os.path.exists(proj_secrets):
         try:
-            tmp = "temp_upload.docx"
-            with open(tmp, "wb") as f:
-                f.write(content)
-            text = docx2txt.process(tmp) or ""
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-            return text
+            os.environ["SCORECARD_API_KEY"] = st.secrets["SCORECARD_API_KEY"]
         except Exception:
-            pass  # fall through to generic decode
+            pass
 
-    # .pdf
-    if name.endswith(".pdf") and PyPDF2 is not None:
-        try:
-            reader = PyPDF2.PdfReader(io.BytesIO(content))
-            pages = []
-            for p in reader.pages:
-                try:
-                    pages.append(p.extract_text() or "")
-                except Exception:
-                    pages.append("")
-            return "\n".join(pages)
-        except Exception:
-            pass  # fall through to generic decode
+configure_api_key()
 
-    # Fallback
-    for enc in ("utf-8", "latin-1"):
-        try:
-            return content.decode(enc, errors="ignore")
-        except Exception:
-            continue
-    return ""
+# ---- rest of your imports (now env is ready) ----
+from src.scorecard_api import ScorecardClient
+from src.cip_map import CIP_MAP
+from src.lor_sop_nlp import score_document
+from src.acceptance import acceptance_probability
+from src.utils import USD, safe
 
-
-def clean_text(t: str) -> str:
-    t = t or ""
-    t = re.sub(r"\s+", " ", t)
-    return t.strip()
-
-
-def keyword_coverage(resume_text: str, jd_text: str):
-    resume = resume_text.lower()
-    words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z\+\#\.\-]{1,}", jd_text.lower()) if len(w) > 2]
-    unique = sorted(set(words))
-    found = [w for w in unique if w in resume]
-    coverage = (len(found) / max(1, len(unique))) * 100.0
-    return coverage, found, unique
-
-
-def similarity_score(resume_text: str, jd_text: str) -> float:
-    docs = [resume_text, jd_text]
-    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
-    try:
-        X = vec.fit_transform(docs)
-        sim = cosine_similarity(X[0:1], X[1:2])[0, 0] * 100.0
-        return float(sim)
-    except Exception:
-        return 0.0
-
-
-def detect_ats_issues(resume_text: str):
-    issues = []
-    if len(resume_text) < 500:
-        issues.append("Resume seems short. Add detail and measurable achievements.")
-    if re.search(r"\t", resume_text):
-        issues.append("Avoid TAB characters; some ATS parsers misread complex formatting.")
-    if not re.search(r"@", resume_text):
-        issues.append("Missing contact email.")
-    if not re.search(r"\d{10}", resume_text) and not re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", resume_text):
-        issues.append("Missing phone number.")
-    if not re.search(r"education|bachelor|master|university", resume_text, flags=re.I):
-        issues.append("Education section not detected (use heading 'Education').")
-    if not re.search(r"experience|work history|employment", resume_text, flags=re.I):
-        issues.append("Experience section not detected (use heading 'Experience').")
-    return issues
-
-
-def generate_suggestions(resume_text: str, jd_text: str, found_keywords):
-    suggestions = []
-    _, _, all_keywords = keyword_coverage(resume_text, jd_text)
-    missing = [w for w in all_keywords if w not in found_keywords][:15]
-    if missing:
-        suggestions.append(f"Add relevant JD keywords (missing examples: {', '.join(missing[:10])}).")
-    if not re.search(r"\b(\d+%|\d{2,})\b", resume_text):
-        suggestions.append("Quantify achievements (e.g., 'Improved accuracy by 12%', 'Processed 1M+ rows').")
-    if resume_text.count("•") < 3 and resume_text.count("- ") < 3:
-        suggestions.append("Use concise bullet points with action verbs (Built, Led, Automated, Reduced).")
-    suggestions.append("Tailor the top 5 bullets to the role’s must-have skills and responsibilities.")
-    return suggestions
-
-
-def example_bullets():
-    return [
-        "Built and deployed an end-to-end ML pipeline in Python (scikit-learn), improving prediction accuracy by 12%.",
-        "Implemented feature engineering and GridSearchCV tuning, reducing inference latency by 30%.",
-        "Developed KPI dashboards (Streamlit) and communicated insights to cross-functional stakeholders.",
-        "Automated data ingestion from APIs; improved data quality and saved ~6 hrs/week of manual work."
-    ]
-
-
-# ========= UI =========
-st.set_page_config(page_title="AI Resume & Job Matcher", page_icon="💼")
-st.title("💼 AI Resume & Job Matcher — Starter (with diagnostics)")
-st.write("Upload your resume, paste a JD, get a **match score**, **keyword coverage**, **ATS checks**, and **tips**. Optional: **AI rewrite** with OpenAI.")
+st.title("🎓 US University Recommender – Real Data + NLP")
 
 with st.sidebar:
-    st.header("How to use")
-    st.markdown(
-        "1) Upload a resume (.pdf/.docx/.txt) **or** paste text\n"
-        "2) Paste the Job Description (JD)\n"
-        "3) Click **Score My Resume**\n"
-        "4) (Optional) Use **AI Rewrite** to tailor your resume"
-    )
-    st.subheader("AI Status")
-    st.write(f"OpenAI SDK installed: **{_OPENAI_INSTALLED}**" + (f" (v{_OPENAI_VERSION})" if _OPENAI_VERSION else ""))
-    st.write("API key detected: **" + ("Yes" if os.getenv("OPENAI_API_KEY") else "No") + "**")
-    st.caption('If "No", set it in this terminal:\n$env:OPENAI_API_KEY="sk-..." and restart the app.')
+    st.header("Your Profile")
+    name = st.text_input("Name", placeholder="Your name")
+    course = st.text_input("Preferred course / major", value="Data Science")
+    loc_mode = st.radio("Location filter", ["State", "City", "ZIP radius", "Anywhere"], index=0)
+    state = city = zipc = radius = None
+    if loc_mode == "State":
+        state = st.text_input("State (2-letter)", value="TX", max_chars=2)
+    elif loc_mode == "City":
+        city = st.text_input("City", value="Dallas")
+        state = st.text_input("State (2-letter)", value="TX", max_chars=2)
+    elif loc_mode == "ZIP radius":
+        zipc = st.text_input("ZIP code", value="75201")
+        radius = st.selectbox("Distance", ["10mi", "25mi", "50mi", "100mi"], index=1)
 
-# Inputs
-resume_file = st.file_uploader("Upload Resume (.pdf, .docx, .txt)", type=["pdf", "docx", "txt"])
-resume_text_manual = st.text_area("Or paste resume text here", height=180, placeholder="Paste your resume text…")
-jd_text = st.text_area("Paste Job Description (JD) here", height=220, placeholder="Paste the target job description…")
+    st.markdown("---")
+    st.subheader("Budget (2 years)")
+    budget = st.number_input("Total budget for 2 years (USD)", min_value=10000, step=1000, value=80000)
 
-# Keep processed texts in session so Rewrite works after scoring
-if "rt" not in st.session_state:
-    st.session_state.rt = ""
-if "jd" not in st.session_state:
-    st.session_state.jd = ""
+    st.markdown("---")
+    st.subheader("Academics")
+    cgpa = st.number_input("CGPA (out of 4.0)", min_value=0.0, max_value=4.0, step=0.01, value=3.6)
+    gre = st.number_input("GRE (optional)", min_value=0, max_value=340, step=1, value=320)
+    ielts = st.number_input("IELTS (optional)", min_value=0.0, max_value=9.0, step=0.5, value=7.0)
 
-if st.button("🔎 Score My Resume", type="primary"):
-    with st.spinner("Analyzing…"):
-        rt = extract_text_from_upload(resume_file) if resume_file else ""
-        if not rt and resume_text_manual:
-            rt = resume_text_manual
+    st.markdown("---")
+    st.subheader("LOR / SOP Upload (PDF or .txt)")
+    lor_sop_kind = st.radio("Document type", ["SOP", "LOR"], index=0)
+    upload = st.file_uploader("Upload LOR/SOP (PDF or .txt)", type=["pdf", "txt"])
 
-        rt = clean_text(rt)
-        jd = clean_text(jd_text)
+    st.markdown("---")
+    st.caption("Costs use College Scorecard tuition + on-campus room/board + other on-campus expenses; books shown separately.")
 
-        if not rt or not jd:
-            st.error("Please provide both a resume and a job description (JD).")
-        else:
-            # store so rewrite can use them
-            st.session_state.rt = rt
-            st.session_state.jd = jd
+if "go" not in st.session_state:
+    st.session_state["go"] = False
 
-            sim = similarity_score(rt, jd)
-            coverage, found, _ = keyword_coverage(rt, jd)
-            issues = detect_ats_issues(rt)
-            sugg = generate_suggestions(rt, jd, found)
+colL, colR = st.columns([1, 2])
+with colL:
+    if st.button("🔎 Find Universities", use_container_width=True):
+        st.session_state["go"] = True
+with colR:
+    st.info("Tip: you can export results at the bottom as CSV.")
 
-            st.subheader("Results")
-            c1, c2 = st.columns(2)
-            c1.metric("Resume ↔ JD Match (TF-IDF)", f"{sim:.1f}%")
-            c2.metric("Keyword Coverage", f"{coverage:.1f}%")
+if st.session_state.get("go"):
+    client = ScorecardClient()
 
-            st.markdown("**Keywords detected in your resume (from JD)**")
-            st.write(", ".join(found[:100]) if found else "_No JD keywords detected in resume text._")
+    key = (course or "").strip().lower()
+    cip4 = CIP_MAP.get(key)
+    title_contains = None if cip4 else course
+    zip_radius = (zipc, radius) if (zipc and radius) else None
 
-            if issues:
-                st.markdown("### ATS-style Checks (basic)")
-                for i in issues:
-                    st.warning(i)
+    results = []
+    for page in range(0, 3):
+        data = client.search(
+            state=state,
+            city=city,
+            zip_radius=zip_radius,
+            cip4=cip4,
+            title_contains=title_contains,
+            page=page,
+        )
+        page_results = data.get("results", [])
+        results.extend(page_results)
+        if len(page_results) < 100:
+            break
 
-            st.markdown("### Suggestions to Improve")
-            for s in sugg:
-                st.info("• " + s)
+    if not results:
+        st.warning("No matching institutions found. Try broadening location or course.")
+        st.stop()
 
-            st.markdown("### Example Bullet Points You Can Adapt")
-            for b in example_bullets():
-                st.write(f"- {b}")
+    lor_score = 0.5
+    lor_details = {}
+    if upload is not None:
+        bytes_data = upload.read()
+        lor_score, lor_details = score_document(bytes_data, upload.name, kind_hint=lor_sop_kind.lower())
 
-            with st.expander("Show extracted resume text (debug)"):
-                st.text(rt[:6000])
+    rows = []
+    for r in results:
+        name_ = safe(r.get("school.name"), "")
+        city_ = safe(r.get("school.city"), "")
+        state_ = safe(r.get("school.state"), "")
+        url_ = safe(r.get("school.school_url"), "")
 
-# ========= AI Rewrite Section (uses session-state texts) =========
-st.markdown("---")
-st.markdown("### ✨ AI Rewrite (optional)")
+        base_rate = r.get("latest.admissions.admission_rate.overall")
+        in_tuition = r.get("latest.cost.tuition.in_state") or 0
+        out_tuition = r.get("latest.cost.tuition.out_of_state") or 0
+        room = r.get("latest.cost.roomboard.oncampus") or 0
+        other = r.get("latest.cost.other_on_campus") or 0
+        books = r.get("latest.cost.booksupply") or 0
 
-if not st.session_state.rt or not st.session_state.jd:
-    st.info("Add a resume and JD above, then click **Score My Resume** first. The rewrite uses those texts.")
-else:
-    if st.button("Rewrite my resume for this JD"):
-        client, err = get_openai_client()
-        if err:
-            st.error(err)
-        else:
-            with st.spinner("Rewriting…"):
-                prompt = f"""
-You are an expert resume editor. Rewrite the RESUME to better match the JOB DESCRIPTION.
-- Keep only truthful content (no fake experience).
-- Keep ATS-friendly formatting (plain text, clear section headings).
-- Add missing keywords naturally.
-- Quantify achievements where possible.
-- Output plain text only (no markdown).
+        tuition = out_tuition if out_tuition else in_tuition
+        living = (room or 0) + (other or 0)
 
---- RESUME ---
-{st.session_state.rt}
+        per_year = (tuition or 0) + living
+        two_year = 2 * per_year
+        meets_budget = two_year <= budget
 
---- JOB DESCRIPTION ---
-{st.session_state.jd}
-"""
-                try:
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3,
-                    )
-                    revised = resp.choices[0].message.content.strip()
-                    st.download_button("Download Revised Resume (TXT)", revised, file_name="revised_resume.txt")
-                    st.text_area("Revised Resume (preview)", revised, height=350)
-                except Exception as e:
-                    st.error(f"Rewrite failed: {e}")
+        acc = acceptance_probability(
+            base_rate,
+            cgpa=cgpa,
+            gre=(gre or None),
+            ielts=(ielts or None),
+            lor_sop=lor_score,
+        )
 
-st.markdown("---")
-st.caption("Starter template. Next: persistence (SQLite/Supabase), multi-JD ranking, and Stripe paywall.")
+        rows.append(
+            {
+                "Institution": name_,
+                "City": city_,
+                "State": state_,
+                "URL": url_,
+                "Tuition (yr)": tuition,
+                "Living (yr)": living,
+                "Books (yr)": books,
+                "Total (yr)": per_year,
+                "Total (2y)": two_year,
+                "Baseline admit": base_rate,
+                "Your admit %": round(100 * acc, 1),
+                "Within budget?": "✅" if meets_budget else "—",
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df.sort_values(["Within budget?", "Total (2y)", "Your admit %"], ascending=[False, True, False], inplace=True)
+
+    st.subheader("Results")
+    st.dataframe(
+        df.assign(
+            **{
+                "Tuition (yr)": df["Tuition (yr)"].map(lambda x: USD.format(x) if x else "—"),
+                "Living (yr)": df["Living (yr)"].map(lambda x: USD.format)
+            }
+        )
+    ) 
