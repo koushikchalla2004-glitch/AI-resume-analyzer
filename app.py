@@ -1,25 +1,19 @@
 import os
-import io
-import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# ---- MUST be the first Streamlit call ----
 st.set_page_config(page_title="US University Recommender", page_icon="🎓", layout="wide")
 
-# ---- Env/Secrets handling (NO warning locally) ----
-def configure_api_key():
-    load_dotenv()  # read .env for local runs
-    if os.getenv("SCORECARD_API_KEY"):
-        return
-    # Only try st.secrets if a secrets.toml actually exists
-    user_secrets = os.path.expanduser("~/.streamlit/secrets.toml")
-    proj_secrets = os.path.join(os.getcwd(), ".streamlit", "secrets.toml")
-    if os.path.exists(user_secrets) or os.path.exists(proj_secrets):
-        try:
-            os.environ["SCORECARD_API_KEY"] = st.secrets["SCORECARD_API_KEY"]
-        except Exception:
-            pass
+# Load .env for local
+load_dotenv()
+
+# Always try Streamlit Cloud secrets; harmless locally (will just skip if not present)
+try:
+    key = st.secrets.get("SCORECARD_API_KEY", None)
+    if key:
+        os.environ["SCORECARD_API_KEY"] = key
+except Exception:
+    pass
 
 configure_api_key()
 
